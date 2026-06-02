@@ -1,12 +1,85 @@
-import { INodeType, INodeExecutionData, IExecuteFunctions,INodeTypeDescription, NodeConnectionType, INodeInputConfiguration, INodeOutputConfiguration } from 'n8n-workflow';
-import { join } from 'path';
+import { INodeType, INodeExecutionData, IExecuteFunctions, INodeTypeDescription, NodeOperationError } from 'n8n-workflow';
+import { join, resolve } from 'path';
 import { platform } from 'os';
+import { mkdirSync, existsSync } from 'fs';
 import { getBrowserExecutablePath } from './utils';
 import { handleOperation } from './operations';
 import { runCustomScript } from './customScript';
-import { IBrowserOptions } from './types';
+import { IBrowserOptions, IBrowserSession, ISessionOptions } from './types';
 import { installBrowser } from '../scripts/setup-browsers';
 import { BrowserType } from './config';
+
+/**
+ * Creates a browser session — either a standard ephemeral session or a
+ * persistent context session that reuses a profile directory on disk.
+ *
+ * Ephemeral:  browser.launch() → browser.newContext() → context.newPage()
+ * Persistent: browserType.launchPersistentContext(dir, opts) → context.newPage()
+ *             (launchPersistentContext returns a BrowserContext, not a Browser)
+ */
+async function launchBrowserSession(
+    playwright: any,
+    browserType: BrowserType,
+    executablePath: string,
+    browserOptions: IBrowserOptions,
+    sessionOptions: ISessionOptions,
+    node: ReturnType<IExecuteFunctions['getNode']>,
+): Promise<IBrowserSession> {
+    const launchArgs = {
+        headless: browserOptions.headless !== false,
+        slowMo: browserOptions.slowMo || 0,
+        executablePath,
+    };
+
+    if (sessionOptions.usePersistentProfile) {
+        const rawDir = sessionOptions.profileDirectory?.trim();
+        if (!rawDir) {
+            throw new NodeOperationError(
+                node,
+                'Profile Directory must not be empty when "Use Persistent Browser Profile" is enabled. ' +
+                'Example path: /home/node/.n8n/playwright-profiles/default',
+            );
+        }
+
+        const profileDir = resolve(rawDir);
+
+        if (!existsSync(profileDir)) {
+            if (sessionOptions.createDirectoryIfMissing !== false) {
+                mkdirSync(profileDir, { recursive: true });
+            } else {
+                throw new NodeOperationError(
+                    node,
+                    `Profile directory does not exist: ${profileDir}. ` +
+                    'Enable "Create Directory If Missing" or create it manually before running.',
+                );
+            }
+        }
+
+        // launchPersistentContext returns a BrowserContext directly (no separate Browser object).
+        const context = await playwright[browserType].launchPersistentContext(profileDir, launchArgs);
+        const pages = context.pages() as any[];
+        const page = pages.length > 0 ? pages[0] : await context.newPage();
+
+        return { browser: null, context, page, isPersistent: true };
+    }
+
+    const browser = await playwright[browserType].launch(launchArgs);
+    const context = await browser.newContext();
+    const page = await context.newPage();
+    return { browser, context, page, isPersistent: false };
+}
+
+/**
+ * Closes a browser session without deleting any profile data.
+ * In persistent mode only the context is closed; the profile directory is untouched.
+ */
+async function closeBrowserSession(session: IBrowserSession): Promise<void> {
+    if (session.isPersistent) {
+        await session.context.close();
+    } else {
+        await session.browser.close();
+    }
+}
 
 export class Playwright implements INodeType {
     description : INodeTypeDescription = {
@@ -20,18 +93,8 @@ export class Playwright implements INodeType {
     defaults: {
         name: 'Playwright',
     },
-    inputs: [
-        {
-            displayName: 'Input',
-            type: NodeConnectionType.Main,
-        } as INodeInputConfiguration,
-    ],
-    outputs: [
-        {
-            displayName: 'Output',
-            type: NodeConnectionType.Main,
-        } as INodeOutputConfiguration,
-    ],
+    inputs: ['main'],
+    outputs: ['main'],
 
     properties: [
         {
@@ -68,7 +131,7 @@ export class Playwright implements INodeType {
                     name: 'Run Custom Script',
                     value: 'runCustomScript',
                     description: 'Execute custom JavaScript code with full Playwright API access',
-                    action: 'Run custom JavaScript code',
+                    action: 'Run custom java script code',
                 },
                 {
                     name: 'Take Screenshot',
@@ -178,7 +241,7 @@ return [{
                 {
                     name: 'XPath',
                     value: 'xpath',
-                    description: 'Use XPath expression (e.g., //button[@id="submit"])',
+                    description: 'Use XPath expression (e.g., //button[@ID="submit"])',
                 }
             ],
             default: 'css',
@@ -197,7 +260,7 @@ return [{
             type: 'string',
             default: '',
             placeholder: '#submit-button',
-            description: 'CSS selector for the element (e.g., #id, .class, button[type="submit"])',
+            description: 'CSS selector for the element (e.g., #ID, .class, button[type="submit"])',
             displayOptions: {
                 show: {
                     operation: ['getText', 'clickElement', 'fillForm'],
@@ -213,7 +276,7 @@ return [{
             name: 'xpath',
             type: 'string',
             default: '',
-            placeholder: '//button[@id="submit"]',
+            placeholder: '//button[@ID="submit"]',
             description: 'XPath expression for the element (e.g., //div[@class="content"], //button[text()="Click Me"])',
             displayOptions: {
                 show: {
@@ -308,6 +371,38 @@ return [{
                 },
             ],
         },
+        {
+            displayName: 'Session',
+            name: 'sessionOptions',
+            type: 'collection',
+            placeholder: 'Add Session Option',
+            default: {},
+            description: 'Configure browser session persistence to reuse cookies and login state across executions',
+            options: [
+                {
+                    displayName: 'Use Persistent Browser Profile',
+                    name: 'usePersistentProfile',
+                    type: 'boolean',
+                    default: false,
+                    description: 'Whether to reuse a browser profile stored on disk. Allows session cookies and login state to persist between workflow runs. When disabled (default) a fresh ephemeral session is used every time.',
+                },
+                {
+                    displayName: 'Profile Directory',
+                    name: 'profileDirectory',
+                    type: 'string',
+                    default: '',
+                    placeholder: '/home/node/.n8n/playwright-profiles/default',
+                    description: 'Absolute path to the browser profile directory on the n8n host or container filesystem. In Docker, this must point to a mounted volume path. Example: /home/node/.n8n/playwright-profiles/default',
+                },
+                {
+                    displayName: 'Create Directory If Missing',
+                    name: 'createDirectoryIfMissing',
+                    type: 'boolean',
+                    default: true,
+                    description: 'Whether to automatically create the profile directory if it does not exist. When disabled, the node will throw an error if the directory is missing.',
+                },
+            ],
+        },
     ],
 };
 
@@ -319,6 +414,9 @@ return [{
             const operation = this.getNodeParameter('operation', i) as string;
             const browserType = this.getNodeParameter('browser', i) as BrowserType;
             const browserOptions = this.getNodeParameter('browserOptions', i) as IBrowserOptions;
+            const sessionOptions = this.getNodeParameter('sessionOptions', i) as ISessionOptions;
+
+            let session: IBrowserSession | undefined;
 
             try {
                 const playwright = require('playwright');
@@ -336,33 +434,37 @@ return [{
 
                 console.log(`Launching browser from: ${executablePath}`);
 
-                const browser = await playwright[browserType].launch({
-                    headless: browserOptions.headless !== false,
-                    slowMo: browserOptions.slowMo || 0,
+                session = await launchBrowserSession(
+                    playwright,
+                    browserType,
                     executablePath,
-                });
-
-                const context = await browser.newContext();
-                const page = await context.newPage();
+                    browserOptions,
+                    sessionOptions,
+                    this.getNode(),
+                );
+                const { browser, context, page, isPersistent } = session;
 
                 let result;
 
                 if (operation === 'runCustomScript') {
-                    // Custom script doesn't need URL navigation beforehand
                     console.log(`Processing ${i + 1} of ${items.length}: [runCustomScript] Custom Script`);
-                    result = await runCustomScript(this, i, browser, page, playwright);
-                    await browser.close();
+                    // In persistent mode browser is null; expose context as $browser so
+                    // scripts can still call $browser.newPage() / $browser.pages() etc.
+                    result = await runCustomScript(this, i, isPersistent ? context : browser, page, playwright);
+                    await closeBrowserSession(session);
                     returnData.push(...result);
                 } else {
-                    // Standard operations need URL navigation
                     const url = this.getNodeParameter('url', i) as string;
                     await page.goto(url);
-
                     result = await handleOperation(operation, page, this, i);
-                    await browser.close();
+                    await closeBrowserSession(session);
                     returnData.push(result);
                 }
             } catch (error) {
+                // Ensure the session is cleaned up even on failure
+                if (session) {
+                    try { await closeBrowserSession(session); } catch { /* ignore cleanup errors */ }
+                }
                 console.error(`Browser launch error:`, error);
                 if (this.continueOnFail()) {
                     returnData.push({

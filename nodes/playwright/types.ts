@@ -27,3 +27,17 @@ export interface IScreenshotOptions {
     fullPage?: boolean;
     path?: string;
 }
+
+export interface ISessionOptions {
+    usePersistentProfile?: boolean;
+    profileDirectory?: string;
+    createDirectoryIfMissing?: boolean;
+}
+
+export interface IBrowserSession {
+    /** Browser instance (ephemeral mode) or null (persistent context mode). */
+    browser: any;
+    context: any;
+    page: any;
+    isPersistent: boolean;
+}

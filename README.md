@@ -7,6 +7,7 @@ This is an n8n community node. It lets you automate browser actions using Playwr
 [Installation](#installation)  
 [Operations](#operations)  
 [Custom Scripts](#custom-scripts)  
+[Session Persistence](#session-persistence)  
 [Compatibility](#compatibility)  
 [Resources](#resources)  
 [Version history](#version-history)  
@@ -438,6 +439,61 @@ return [{
 6. **Access input data**: Use `$json` or `$input` to access data from previous nodes
 7. **Browser cleanup**: The browser is automatically closed after script execution
 
+## Session Persistence
+
+By default every node execution launches a fresh, isolated browser (ephemeral mode) with no cookies or stored data. The **Session** option group lets you launch the browser against a persistent profile directory so that cookies, `localStorage`, IndexedDB, and any other browser storage survive across workflow runs.
+
+### What it does
+
+- Calls Playwright's `launchPersistentContext(userDataDir, options)` API instead of `browser.launch()`.
+- The entire browser profile — cookies, session tokens, cached data — is stored on disk in the directory you specify.
+- Re-running the node with the same directory reuses that state automatically.
+- Closing n8n or restarting the container does **not** clear the profile as long as the directory is on persistent storage.
+
+### How to configure it
+
+Open the **Session** collection in the node editor and add the following options:
+
+| Field | Value |
+|---|---|
+| **Use Persistent Browser Profile** | `true` |
+| **Profile Directory** | Absolute path on the host/container (see below) |
+| **Create Directory If Missing** | `true` (default) — creates the directory on first run |
+
+#### Example paths
+
+| Environment | Example path |
+|---|---|
+| Self-hosted (bare metal / VM) | `/home/youruser/.n8n/playwright-profiles/mysite` |
+| Docker / Kubernetes | `/home/node/.n8n/playwright-profiles/mysite` |
+| Windows self-hosted | `C:\Users\YourUser\.n8n\playwright-profiles\mysite` |
+
+### Docker / container note
+
+The profile directory must live inside the container filesystem. Mount a host directory as a volume so the profile outlives the container:
+
+```yaml
+# docker-compose.yml excerpt
+volumes:
+  - /your/host/path/playwright-profiles:/home/node/.n8n/playwright-profiles
+```
+
+Then set **Profile Directory** to `/home/node/.n8n/playwright-profiles/default` inside the node.
+
+### Browser support
+
+`launchPersistentContext` is supported by all three Playwright engines (Chromium, Firefox, WebKit). Chromium is recommended for best compatibility with modern web authentication flows.
+
+### Cleanup behaviour
+
+Only the runtime browser context is closed after each execution. The profile directory is **never** deleted or modified by the node. To reset a session, delete the directory contents manually.
+
+### Custom Script access
+
+In persistent mode `$browser` inside a **Run Custom Script** operation refers to the `BrowserContext` (not a `Browser`). The context exposes the same `newPage()` and `pages()` methods, so most scripts work unchanged. If your script calls `$browser.newContext()`, switch to ephemeral mode or refactor to use `$page.context()` instead.
+
+---
+
 ## Compatibility
 
 - Requires n8n version 1.0.0 or later
@@ -457,6 +513,16 @@ return [{
 - [Playwright API Reference](https://playwright.dev/docs/api/class-playwright)
 
 ## Version history
+
+### 0.3.1
+
+- Added **Session Persistence** support via a new `Session` option group
+- New `Use Persistent Browser Profile` toggle (boolean, default off — fully backward-compatible)
+- New `Profile Directory` field for specifying the on-disk user-data directory
+- New `Create Directory If Missing` option for automatic directory creation
+- Refactored browser launch logic into `launchBrowserSession` / `closeBrowserSession` helpers
+- Improved error handling: session cleanup now runs even when an operation throws
+- `$browser` in custom scripts falls back to the persistent `BrowserContext` when persistent mode is active
 
 ### 0.3.0
 
